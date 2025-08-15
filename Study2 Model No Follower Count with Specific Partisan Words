@@ -1,0 +1,155 @@
+import pandas as pd
+import numpy as np
+import re
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# File paths
+politicians_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/Study 2 Datasets Good/PoliticansEmotionMFTPartisanCleanedPartisanWordCountKeysFixed.csv'
+engaged_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/Study 2 Datasets Good/politicalResultsFullAllFunctionsKeysFixed.csv'
+random_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/Study 2 Datasets Good/randomusersResultsFullAllFunctionsKeysFixed.csv'
+russian_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/Study 2 Datasets Good/3millionTweetsCleanedPartisanWordsIVKeysFixedCLEAN.csv'
+
+# Load datasets
+politicians = pd.read_csv(politicians_path)
+engaged_users = pd.read_csv(engaged_users_path)
+random_users = pd.read_csv(random_users_path)
+russian = pd.read_csv(russian_path)
+
+# Label the training data
+politicians['author_type'] = 'politician'
+engaged_users['author_type'] = 'engaged_user'
+random_users['author_type'] = 'random_user'
+
+# Combine datasets
+combined_df = pd.concat([politicians, engaged_users, random_users], ignore_index=True)
+
+# Extract score from strings like "care (0.87)"
+def extract_score(val):
+    if isinstance(val, str):
+        match = re.search(r"\((\d\.\d+)\)", val)
+        return float(match.group(1)) if match else 0.0
+    return 0.0
+
+# Apply to MFT columns
+mft_cols = [
+    'Loyaltyclassification_result', 'Sanctityclassification_result',
+    'Careclassification_result', 'Fairnessclassification_result',
+    'Authorityclassification_result'
+]
+for col in mft_cols:
+    combined_df[col] = combined_df[col].apply(extract_score)
+    russian[col] = russian[col].apply(extract_score)
+
+# Top partisan words (just the word, no 'pw_' prefix in original column)
+top_partisan_keywords = [
+    'maga', 'freedom', 'trump', 'america', 'biden',
+    'patriot', 'conservative', 'democrats', 'usa', 'constitution',
+    'antifa', 'climate', 'infrastructure', 'feminism', 'socialism',
+    'racism', 'liberals', 'abortion', 'mask', 'diversity'
+]
+
+# Convert comma-separated string column into list and create binary flags
+def add_partisan_word_flags(df):
+    df['partisan_words'] = df['partisan_words'].fillna('').str.lower().str.split(', ')
+    for word in top_partisan_keywords:
+        col_name = f'pw_{word}'
+        df[col_name] = df['partisan_words'].apply(lambda x: int(word in x if isinstance(x, list) else False))
+    return df
+
+combined_df = add_partisan_word_flags(combined_df)
+russian = add_partisan_word_flags(russian)
+
+# Create feature names from flag columns
+top_partisan_term_features = [f'pw_{word}' for word in top_partisan_keywords]
+
+# Final features
+features = [
+    'fear', 'anger', 'trust', 'surprise', 'sadness', 'disgust', 'joy',
+    'Loyaltyclassification_result', 'Sanctityclassification_result',
+    'Careclassification_result', 'Fairnessclassification_result',
+    'Authorityclassification_result', 'partisan_word_count', 
+] + top_partisan_term_features
+
+# Force all feature columns to be numeric and fill NaNs with 0
+for col in features:
+    if col in combined_df.columns:
+        combined_df[col] = pd.to_numeric(combined_df[col], errors='coerce').fillna(0.0)
+    if col in russian.columns:
+        russian[col] = pd.to_numeric(russian[col], errors='coerce').fillna(0.0)
+
+# Define X, y
+X = combined_df[features]
+label_mapping = {'politician': 0, 'engaged_user': 1, 'random_user': 2}
+combined_df['author_type_numeric'] = combined_df['author_type'].map(label_mapping)
+y = combined_df['author_type_numeric']
+
+print(f"Total training rows used: {len(X):,}")
+
+# Split train/test
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Train XGBoost
+model = XGBClassifier(
+    objective='multi:softprob',
+    eval_metric='mlogloss',
+    use_label_encoder=False,
+    num_class=3,
+    random_state=42
+)
+print("Training XGBoost...")
+model.fit(X_train, y_train)
+
+# Evaluate
+y_pred = model.predict(X_test)
+print("Classification Report:")
+print(classification_report(y_test, y_pred, target_names=label_mapping.keys()))
+
+conf_matrix = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(10, 7))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+            xticklabels=label_mapping.keys(), yticklabels=label_mapping.keys())
+plt.title("Confusion Matrix: No Follower Count Top Partisan Words")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.show()
+
+# Feature importance
+importances = pd.DataFrame({
+    'Feature': features,
+    'Importance': model.feature_importances_
+}).sort_values(by='Importance', ascending=False)
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x='Importance', y='Feature', data=importances)
+plt.title("Feature Importance: No Follower Count Top Partisan Words")
+plt.show()
+
+# Predict Russian data
+russian_features = russian[features]
+russian_predictions = model.predict(russian_features)
+russian['predicted_author_type'] = [list(label_mapping.keys())[int(p)] for p in russian_predictions]
+
+# Output stats
+label_counts = russian['predicted_author_type'].value_counts()
+label_percentages = (label_counts / len(russian)) * 100
+print("Russian prediction breakdown (%):")
+print(label_percentages)
+
+# Pie chart
+plt.figure(figsize=(8, 6))
+label_percentages.plot(kind='pie', autopct='%1.1f%%', startangle=140,
+                       colors=['lightblue', 'lightgreen', 'salmon'])
+plt.title("Predicted Author Types: No Follower Count Top Partisan Words")
+plt.ylabel("")
+plt.show()
+
+# Save output
+save_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/predicted_russian_messages_nofollowercount_top partisan words.csv'
+russian.to_csv(save_path, index=False)
+print(f"Predictions saved to: {save_path}")
