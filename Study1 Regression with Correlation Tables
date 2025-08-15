@@ -27,19 +27,25 @@ rel_index = df.loc[rel_index].dropna(subset=["retweet_count"]).index
 y_ols = np.log2(df.loc[rel_index]["retweet_count"].copy() + 1)
 y_glm = df.loc[rel_index]["like_count"].copy()
 
-# Regression function with printed correlation tables
+# Regression function with Pearson and Spearman correlation tables
 def run_regression(X, y_ols, y_glm, description):
     print(f"\n>>> Running regression: {description}")
     print(f"  → X rows: {X.shape[0]}, y rows: {y_ols.shape[0]}")
     
-    # Correlation matrix and summary stats
-    corr = X.corr().round(3)
+    # Pearson correlation matrix and summary stats
+    corr_pearson = X.corr(method="pearson").round(3)
+    print(f"\n[PEARSON Correlation Matrix – {description}]:\n{corr_pearson.to_string()}")
+    
+    # Spearman correlation matrix
+    corr_spearman = X.corr(method="spearman").round(3)
+    print(f"\n[SPEARMAN Correlation Matrix – {description}]:\n{corr_spearman.to_string()}")
+    
+    # Summary statistics
     summary = pd.DataFrame({
         "Mean": X.mean().round(3),
         "SD": X.std().round(3),
         "N": X.count()
     })
-    print(f"\n[Correlation Matrix – {description}]:\n{corr.to_string()}")
     print(f"\n[Summary Stats – {description}]:\n{summary.to_string()}")
 
     ols_model = sm.OLS(y_ols, X).fit()
@@ -91,6 +97,20 @@ unique_words = set(word for words in df["partisan_words"] for word in words if w
 X_partisan = pd.DataFrame({word: df["partisan_words"].apply(lambda x: int(word in x)) for word in unique_words}, index=df.index)
 X_partisan["follower_count"] = np.log2(df["follower_count"] + 1)
 X_partisan = sm.add_constant(X_partisan.loc[rel_index])
+
+# Pearson + Spearman for partisan words too
+corr_pearson = X_partisan.corr(method="pearson").round(3)
+print(f"\n[PEARSON Correlation Matrix – Partisan Words + Follower Count]:\n{corr_pearson.to_string()}")
+
+corr_spearman = X_partisan.corr(method="spearman").round(3)
+print(f"\n[SPEARMAN Correlation Matrix – Partisan Words + Follower Count]:\n{corr_spearman.to_string()}")
+
+summary = pd.DataFrame({
+    "Mean": X_partisan.mean().round(3),
+    "SD": X_partisan.std().round(3),
+    "N": X_partisan.count()
+})
+print(f"\n[Summary Stats – Partisan Words + Follower Count]:\n{summary.to_string()}")
 
 ols_model = sm.OLS(y_ols, X_partisan).fit()
 glm_model = sm.GLM(y_glm, X_partisan, family=sm.families.NegativeBinomial(alpha=2)).fit(cov_type="HC2")
