@@ -24,8 +24,8 @@ nltk.download('vader_lexicon', quiet=True)
 nltk.download('stopwords', quiet=True)
 
 # File paths
-base_file_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/English_Only_Tweets4.23GBDataCounted.csv'
-final_output_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/TestOutputs/PoliticansEmotionMFTPartisan.csv' #ALWAYS use a new file name or it won't append correctly
+base_file_path = '/Users/datatobeconverted.csv'
+final_output_path = '/Users/dataappendedwithMFTEmotionPartisanWordsandPartisanWordCount.csv' #ALWAYS use a new file name or it won't append correctly
 
 # Expanded partisan keywords list
 PARTISAN_KEYWORDS = [
