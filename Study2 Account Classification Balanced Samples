@@ -1,0 +1,168 @@
+import pandas as pd
+import re
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# File paths
+politicians_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/Study 2 Datasets Good/PoliticansEmotionMFTPartisanCleanedPartisanWordwithScreenName_downsampled_3.1M.csv'
+engaged_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/Study 2 Datasets Good/PoliticallyEngagedUserswithScreenName_downsampled_3.1M.csv'
+random_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/Study 2 Datasets Good/randomusersResultswithScreenName_downsampled_3.1M.csv'
+russian_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/Study 2 Datasets Good/3millionTweetsCleanedPartisanWordsIVKeysFixedCLEAN_Renamed.csv'
+russian_output_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/PredictedRussianAccountsBalancedSample.csv'
+
+# === Top 20 most impactful partisan words from Study 1 ===
+top_partisan_words = [
+    # Top 10 positive predictors
+    'parkland shooting', 'march for our lives', 'cnn sucks', '#metoo',
+    'take a knee', 'kaepernick', 'blue lives matter', 'all lives matter',
+    'build the wall', 'blm',
+
+    # Top 10 negative predictors
+    'red pill', 'climate change hoax', 'kavanaugh', 'ukraine',
+    'tea party', 'mcconnell', 'obamacare', 'deep state', 'gop', 'biden'
+]
+
+# === Load all datasets ===
+def load_and_prepare(path):
+    df = pd.read_csv(path, low_memory=False)
+    # Clean MFT classification values
+    def extract_score(val):
+        if isinstance(val, str):
+            match = re.search(r"\((\d\.\d+)\)", val)
+            return float(match.group(1)) if match else 0.0
+        return float(val) if pd.notnull(val) else 0.0
+
+    mft_cols = [
+        'Loyaltyclassification_result', 'Sanctityclassification_result',
+        'Careclassification_result', 'Fairnessclassification_result',
+        'Authorityclassification_result'
+    ]
+    for col in mft_cols:
+        df[col] = df[col].apply(extract_score)
+
+    for word in top_partisan_words:
+        if word not in df.columns:
+            df[word] = 0
+    return df
+
+politicians = load_and_prepare(politicians_path)
+engaged_users = load_and_prepare(engaged_users_path)
+random_users = load_and_prepare(random_users_path)
+russian = load_and_prepare(russian_path)
+
+# === Aggregation function ===
+def aggregate_user_data(df):
+    mft_cols = [
+        'Loyaltyclassification_result', 'Sanctityclassification_result',
+        'Careclassification_result', 'Fairnessclassification_result',
+        'Authorityclassification_result'
+    ]
+    emotion_cols = ['fear', 'anger', 'trust', 'surprise', 'sadness', 'disgust', 'joy']
+    word_flags = top_partisan_words
+
+    # Compute presence rate for MFT and emotions
+    mft_presence = df[mft_cols] > 0
+    emotion_presence = df[emotion_cols] > 0
+    presence_df = pd.concat([df[['screen_name']], mft_presence, emotion_presence], axis=1)
+
+    mft_pct = presence_df.groupby('screen_name')[mft_cols].mean()
+    emotion_pct = presence_df.groupby('screen_name')[emotion_cols].mean()
+
+    # Sum and mean of partisan word count, renamed for clarity
+    partisan_stats = df.groupby('screen_name')['partisan_word_count'].agg(
+        sum_partisan_word_count='sum',
+        mean_partisan_word_count='mean'
+    )
+
+    # Top 20 word binary presence
+    word_max = df.groupby('screen_name')[word_flags].max()
+
+    # Combine all
+    features_df = pd.concat([mft_pct, emotion_pct, partisan_stats, word_max], axis=1)
+    return features_df
+
+# === Aggregate all training datasets ===
+agg_politicians = aggregate_user_data(politicians)
+agg_engaged = aggregate_user_data(engaged_users)
+agg_random = aggregate_user_data(random_users)
+
+agg_politicians['author_type'] = 0
+agg_engaged['author_type'] = 1
+agg_random['author_type'] = 2
+
+# === Combine and prep training set ===
+combined_df = pd.concat([agg_politicians, agg_engaged, agg_random], axis=0)
+features = combined_df.drop(columns=['author_type']).columns.tolist()
+X = combined_df[features].fillna(0.0)
+y = combined_df['author_type']
+
+# === Train/Test split ===
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# === Train XGBoost ===
+model = XGBClassifier(
+    objective='multi:softprob',
+    eval_metric='mlogloss',
+    use_label_encoder=False,
+    num_class=3,
+    random_state=42
+)
+print("Training XGBoost...")
+model.fit(X_train, y_train)
+
+# === Evaluation ===
+y_pred = model.predict(X_test)
+print("Classification Report:")
+print(classification_report(y_test, y_pred, target_names=['politician', 'engaged_user', 'random_user']))
+
+# === Confusion matrix ===
+conf_matrix = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(10, 7))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['politician', 'engaged_user', 'random_user'],
+            yticklabels=['politician', 'engaged_user', 'random_user'])
+plt.title("Confusion Matrix: Account-Level Classification")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.show()
+
+# === Feature importance ===
+importances = pd.DataFrame({
+    'Feature': features,
+    'Importance': model.feature_importances_
+}).sort_values(by='Importance', ascending=False)
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x='Importance', y='Feature', data=importances)
+plt.title("Feature Importance: Account-Level")
+plt.show()
+
+# === Optional: Add pie chart for class distribution ===
+class_distribution = pd.Series(y_pred).map({0: 'politician', 1: 'engaged_user', 2: 'random_user'}).value_counts()
+plt.figure(figsize=(6, 6))
+class_distribution.plot.pie(autopct='%1.1f%%', startangle=140,
+                            colors=['lightblue', 'lightgreen', 'salmon'])
+plt.title("Predicted Class Distribution")
+plt.ylabel("")
+plt.tight_layout()
+plt.show()
+
+# === Predict Russian accounts ===
+russian_agg = aggregate_user_data(russian)
+russian_X = russian_agg[features].fillna(0.0)
+russian_pred = model.predict(russian_X)
+label_map = {0: 'politician', 1: 'engaged_user', 2: 'random_user'}
+russian_agg['predicted_author_type'] = pd.Series(russian_pred, index=russian_agg.index).map(label_map)
+
+# === Add a sample tweet from each account ===
+sample_tweets = russian.groupby('screen_name')['tweet_text'].first()
+russian_agg['sample_tweet'] = sample_tweets.reindex(russian_agg.index)
+
+# === Save Russian prediction output ===
+russian_agg.reset_index()[['screen_name', 'predicted_author_type', 'sample_tweet']].to_csv(russian_output_path, index=False)
+print(f"✅ Russian account predictions saved to: {russian_output_path}")
