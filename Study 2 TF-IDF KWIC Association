@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+TF-IDF + KWIC contextual analysis
+
+1. Train TF-IDF + XGBoost tweet-level model on balanced U.S. data.
+2. Identify top-N TF-IDF features by global importance.
+3. For each top feature (minus some excluded civic terms), extract ±3-word KWIC windows in:
+   - U.S. politicians
+   - U.S. engaged users
+   - U.S. random users
+   - Russian tweets
+4. For each term × class, compute how often the KWIC window also contains
+   any partisan-dictionary term (co-occurrence rate).
+5. Export summary tables AND ALL KWIC CONTEXTS to CSV for analysis.
+"""
+
+import pandas as pd
+import numpy as np
+import re
+from collections import defaultdict
+
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from xgboost import XGBClassifier
+
+import os
+
+# === File Paths ===
+politicians_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/PoliticiansDownsampled3.1Mil.csv'
+engaged_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/EngagedUsersDownsampled3.1Mil.csv'
+random_users_path  = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/RandomUsersDownsampled3.1Mil.csv'
+russian_path       = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/RussianDatasetStudy2workswithXGBoost.csv'
+
+output_dir = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/KWIC_Outputs'
+
+# === Partisan dictionary (use your full 96-term list here) ===
+PARTISAN_TERMS = [
+    'liberal', 'conservative', 'republican', 'democrat', 'right-wing', 'left-wing', 'progressive', 'alt-right',
+    'establishment', 'deep state', 'drain the swamp', 'fake news', 'mainstream media', 'MSM',
+    'Obama', 'Biden', 'Clinton', 'Trump', 'Pence', 'Sanders', 'Hillary', 'McConnell', 'Pelosi',
+    'DNC', 'GOP', 'Republicans', 'Democrats', 'libertarian', 'independent','Obamacare', 'Tea Party', 'birth certificate', 'socialist', 'czar',
+    'Crooked Hillary', 'Lock her up', 'Make America Great Again', 'MAGA', 'Build the wall', 'Trump Train', 'email server', 'Benghazi',
+    'Trump Derangement Syndrome', 'TDS', 'covfefe', 'alternative facts', 'deep state', 'Hands up don\'t shoot', 'I can\'t breathe', 'Kaepernick', 'take a knee',
+    'racial divide', 'Black Lives Matter', 'BLM', 'all lives matter', 'Blue Lives Matter', 'antifa', 'white supremacy', 'race war', 'social justice', 'racism',
+    'Paris Agreement', 'climate change hoax', 'EPA', 'fracking', 
+    'Russia', 'Ukraine', 'Crimea', 'NATO', 'Putin', 'Syria', 'China', 'Iran', 'ISIS', 'terrorism',
+    'collusion', 'Russia hoax', 'WikiLeaks', 'Podesta emails', 'al-Baghdadi', 'radical Islam', 'caliphate',
+    'trade war', 'tariffs', 'intellectual property theft',  
+    'CNN sucks', 'Fox News', 'Hannity', 'Maddow', 'SJW', 'NPC', 'red pill', 'blue pill',
+    'Parkland shooting', 'March for Our Lives', 'Kavanaugh', 'Me Too', '#MeToo'
+]
+
+# Normalize partisan terms to tokenizer form (lowercase)
+PARTISAN_TERMS = [t.lower() for t in PARTISAN_TERMS]
+PARTISAN_SINGLE_TOKENS = set(
+    [t for t in PARTISAN_TERMS if ' ' not in t]  # single-token terms only
+)
+
+# === Load datasets ===
+politicians   = pd.read_csv(politicians_path, low_memory=True)
+engaged_users = pd.read_csv(engaged_users_path, low_memory=True)
+random_users  = pd.read_csv(random_users_path,  low_memory=True)
+russian       = pd.read_csv(russian_path,       low_memory=True)
+
+# === Label and combine ===
+politicians['author_type']   = 'politician'
+engaged_users['author_type'] = 'engaged_user'
+random_users['author_type']  = 'random_user'
+
+us_df = pd.concat([politicians, engaged_users, random_users], ignore_index=True)
+
+# Drop missing text
+us_df = us_df.dropna(subset=['tweet_text'])
+russian = russian.dropna(subset=['tweet_text'])
+
+# Encode labels (for training); keep author_type for KWIC
+label_map = {'politician': 0, 'engaged_user': 1, 'random_user': 2}
+us_df['label'] = us_df['author_type'].map(label_map)
+
+# === Train/test split (for TF-IDF model only) ===
+X_train, X_test, y_train, y_test = train_test_split(
+    us_df['tweet_text'], us_df['label'],
+    test_size=0.20, stratify=us_df['label'], random_state=42
+)
+
+# === TF-IDF vectorization ===
+vectorizer = TfidfVectorizer(
+    max_features=10000,
+    stop_words='english',
+    min_df=5,
+    max_df=0.8,
+    token_pattern=r'(?u)\b[#\w][#\w-]*\b',
+    lowercase=True,
+    dtype=np.float64
+)
+X_train_tfidf = vectorizer.fit_transform(X_train)
+X_test_tfidf  = vectorizer.transform(X_test)
+
+print("Training XGBoost TF-IDF model for KWIC analysis…")
+model = XGBClassifier(
+    objective='multi:softprob',
+    eval_metric='mlogloss',
+    num_class=3,
+    random_state=42,
+    tree_method="hist",
+    n_estimators=300
+)
+model.fit(X_train_tfidf, y_train)
+
+# === Get top-N global TF-IDF features by importance ===
+feat_importances = model.feature_importances_
+feat_names = np.array(vectorizer.get_feature_names_out())
+
+TOP_N = 50  # initial number of focal terms to consider
+top_idx = np.argsort(feat_importances)[::-1][:TOP_N]
+focal_terms_raw = feat_names[top_idx]
+
+# Exclude some clearly non-partisan civic terms from focal KWIC analysis
+EXCLUDED_FOCAL_TERMS = {'communities', 'continue', 'ensure', 'discuss'}
+focal_terms = np.array([t for t in focal_terms_raw if t not in EXCLUDED_FOCAL_TERMS])
+
+print(f"Top {TOP_N} TF-IDF features selected for KWIC analysis (before exclusion).")
+print(focal_terms_raw)
+print("\nFocal terms used for KWIC after exclusion:")
+print(focal_terms)
+
+# === Tokenization and KWIC helpers ===
+TOKEN_PATTERN = re.compile(r'(?u)\b[#\w][#\w-]*\b')
+
+def tokenize(text: str):
+    """Tokenize using the same pattern as TF-IDF; returns lowercase tokens."""
+    if not isinstance(text, str):
+        return []
+    return TOKEN_PATTERN.findall(text.lower())
+
+def extract_kwic(tokens, focal, window=3):
+    """
+    Return context windows (token lists) for each occurrence of focal token.
+    tokens: list of tokens (already lowercased)
+    focal: single token string (lowercased)
+    """
+    contexts = []
+    for i, tok in enumerate(tokens):
+        if tok == focal:
+            start = max(0, i - window)
+            end   = min(len(tokens), i + window + 1)
+            ctx_tokens = tokens[start:end]
+            contexts.append(ctx_tokens)
+    return contexts
+
+def window_has_partisan(window_tokens, partisan_single_tokens):
+    """Return True if any single-token partisan term appears in the window."""
+    w_set = set(window_tokens)
+    return len(w_set.intersection(partisan_single_tokens)) > 0
+
+# === Prepare combined frame for KWIC (U.S. + Russian) ===
+us_df_small = us_df[['tweet_text', 'author_type']].copy()
+us_df_small['source'] = 'us'
+russian_small = russian[['tweet_text']].copy()
+russian_small['author_type'] = 'russian'
+russian_small['source'] = 'russian'
+
+all_df = pd.concat([us_df_small, russian_small], ignore_index=True)
+
+# Optional: downsample per class for speed/memory
+MAX_DOCS_PER_CLASS = 100000  # adjust or set to None if you want all docs
+
+rng = np.random.default_rng(42)
+
+def sample_by_class(df, class_col, max_docs_per_class):
+    if max_docs_per_class is None:
+        return df.copy()
+    idxs = []
+    for cls in df[class_col].unique():
+        cls_idx = df[df[class_col] == cls].index.to_list()
+        if len(cls_idx) > max_docs_per_class:
+            cls_idx = list(rng.choice(cls_idx, size=max_docs_per_class, replace=False))
+        idxs.extend(cls_idx)
+    return df.loc[idxs].copy()
+
+all_df_sampled = sample_by_class(all_df, 'author_type', MAX_DOCS_PER_CLASS)
+
+# === KWIC analysis ===
+WINDOW = 3
+
+stats_rows = []
+contexts_rows = []
+
+classes = ['politician', 'engaged_user', 'random_user', 'russian']
+
+for term in focal_terms:
+    focal = term.lower()
+    for cls in classes:
+        df_cls = all_df_sampled[all_df_sampled['author_type'] == cls]
+        total_contexts = 0
+        partisan_contexts = 0
+
+        for idx, row in df_cls.iterrows():
+            tokens = tokenize(row['tweet_text'])
+            if not tokens:
+                continue
+
+            kwics = extract_kwic(tokens, focal=focal, window=WINDOW)
+            if not kwics:
+                continue
+
+            for ctx_tokens in kwics:
+                total_contexts += 1
+                has_part = window_has_partisan(ctx_tokens, PARTISAN_SINGLE_TOKENS)
+                if has_part:
+                    partisan_contexts += 1
+
+                # SAVE EVERY CONTEXT INSTANCE
+                contexts_rows.append({
+                    'focal_term': term,
+                    'class': cls,
+                    'context_tokens': ' '.join(ctx_tokens),
+                    'has_partisan_term': int(has_part)
+                })
+
+        if total_contexts > 0:
+            share_partisan = partisan_contexts / total_contexts
+        else:
+            share_partisan = np.nan
+
+        stats_rows.append({
+            'focal_term': term,
+            'class': cls,
+            'total_contexts': total_contexts,
+            'partisan_contexts': partisan_contexts,
+            'share_partisan_contexts': share_partisan
+        })
+
+# === Export results ===
+stats_df = pd.DataFrame(stats_rows)
+contexts_df = pd.DataFrame(contexts_rows)
+
+print("\nKWIC stats (head):")
+print(stats_df.head())
+
+print("\nKWIC ALL contexts (head):")
+print(contexts_df.head())
+
+os.makedirs(output_dir, exist_ok=True)
+
+stats_path = os.path.join(output_dir, 'kwic_stats_top_tfidf_terms.csv')
+contexts_path = os.path.join(output_dir, 'kwic_all_contexts_top_tfidf_terms.csv')
+
+stats_df.to_csv(stats_path, index=False)
+contexts_df.to_csv(contexts_path, index=False)
+
+print(f"\nSaved KWIC stats to: {stats_path}")
+print(f"Saved ALL KWIC contexts to: {contexts_path}")
