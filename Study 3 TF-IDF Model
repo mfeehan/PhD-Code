@@ -1,0 +1,183 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from xgboost import XGBClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# === File Paths (update to full datasets if needed) ===
+politicians_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/PoliticianFullDatasetStudy2.csv'
+engaged_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/EngagedUsersFullDataset_augmented__20251111_175631.csv'
+random_users_path   = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/RandomUsersFullDataset_augmented__20251111_182612.csv'
+russian_path        = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/RussianDatasetStudy2workswithXGBoost.csv'
+
+# === Load tweet-level datasets ===
+politicians   = pd.read_csv(politicians_path)
+engaged_users = pd.read_csv(engaged_users_path)
+random_users  = pd.read_csv(random_users_path)
+russian       = pd.read_csv(russian_path)
+
+# Sanity check required columns
+for df, name in [(politicians, "politicians"),
+                 (engaged_users, "engaged_users"),
+                 (random_users, "random_users"),
+                 (russian, "russian")]:
+    if 'screen_name' not in df.columns or 'tweet_text' not in df.columns:
+        raise ValueError(f"{name} dataset must contain 'screen_name' and 'tweet_text' columns.")
+
+# === Label the U.S. training data ===
+politicians['author_type']   = 'politician'
+engaged_users['author_type'] = 'engaged_user'
+random_users['author_type']  = 'random_user'
+
+# Combine U.S. tweets
+us_tweets = pd.concat([politicians, engaged_users, random_users], ignore_index=True)
+
+# Drop missing tweet_text
+us_tweets = us_tweets.dropna(subset=['tweet_text'])
+russian   = russian.dropna(subset=['tweet_text'])
+
+# === Aggregate to account-level text: concatenate all tweets per account ===
+print("Aggregating U.S. tweets to account-level text...")
+us_accounts = (
+    us_tweets
+    .groupby('screen_name', as_index=False)
+    .agg({
+        'tweet_text': lambda x: ' '.join(x.dropna().astype(str)),
+        'author_type': 'first'
+    })
+)
+us_accounts = us_accounts.rename(columns={'tweet_text': 'account_text'})
+print(f"Total U.S. accounts: {len(us_accounts):,}")
+
+print("Aggregating Russian tweets to account-level text...")
+rus_accounts = (
+    russian
+    .groupby('screen_name', as_index=False)
+    .agg({'tweet_text': lambda x: ' '.join(x.dropna().astype(str))})
+)
+rus_accounts = rus_accounts.rename(columns={'tweet_text': 'account_text'})
+print(f"Total Russian accounts: {len(rus_accounts):,}")
+
+# === Prepare labels ===
+label_mapping = {'politician': 0, 'engaged_user': 1, 'random_user': 2}
+us_accounts['author_type_numeric'] = us_accounts['author_type'].map(label_mapping)
+
+X_text = us_accounts['account_text']
+y = us_accounts['author_type_numeric']
+
+print(f"Total U.S. training accounts used (TF-IDF model): {len(X_text):,}")
+
+# === Train/test split at the account level ===
+X_train_text, X_test_text, y_train, y_test = train_test_split(
+    X_text, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# === TF-IDF vectorization (account-level, concatenated text) ===
+vectorizer = TfidfVectorizer(
+    max_features=10000,
+    stop_words='english',
+    min_df=5,
+    max_df=0.8,
+    token_pattern=r'(?u)\b[#\w][#\w-]*\b',
+    lowercase=True
+)
+
+print("Fitting TF-IDF vectorizer on account-level text...")
+X_train_tfidf = vectorizer.fit_transform(X_train_text)
+X_test_tfidf  = vectorizer.transform(X_test_text)
+
+# Transform Russian accounts with the same vectorizer
+rus_X_tfidf = vectorizer.transform(rus_accounts['account_text'])
+
+# === Train XGBoost account-level TF-IDF model ===
+model = XGBClassifier(
+    objective='multi:softprob',
+    eval_metric='mlogloss',
+    num_class=3,
+    random_state=42,
+    tree_method='hist',
+    n_estimators=300
+)
+
+print("Training XGBoost (account-level TF-IDF)...")
+model.fit(X_train_tfidf, y_train)
+
+# === Evaluate on held-out U.S. accounts ===
+y_pred = model.predict(X_test_tfidf)
+print("Classification Report (account-level TF-IDF):")
+print(classification_report(y_test, y_pred, target_names=list(label_mapping.keys())))
+
+conf_matrix = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(8, 6))
+sns.heatmap(
+    conf_matrix,
+    annot=True,
+    fmt='d',
+    cmap='Blues',
+    xticklabels=list(label_mapping.keys()),
+    yticklabels=list(label_mapping.keys())
+)
+plt.title("Confusion Matrix: Account-Level TF-IDF Classification Model")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+# === Feature importance for TF-IDF features ===
+feat_importances = model.feature_importances_
+feat_names = vectorizer.get_feature_names_out()
+
+fi_df = (
+    pd.DataFrame({'term': feat_names, 'importance': feat_importances})
+    .sort_values(by='importance', ascending=False)
+)
+
+# Plot top 30 TF-IDF features
+top_n = 30
+fi_top = fi_df.head(top_n)
+
+plt.figure(figsize=(10, 8))
+sns.barplot(x='importance', y='term', data=fi_top)
+plt.title("Top TF-IDF Features: Account-Level TF-IDF Classification Model")
+plt.xlabel("Importance")
+plt.ylabel("Term")
+plt.tight_layout()
+plt.show()
+
+# === Predict Russian accounts ===
+rus_pred = model.predict(rus_X_tfidf)
+
+# Map numeric predictions back to labels
+inv_label_map = {v: k for k, v in label_mapping.items()}
+rus_accounts['predicted_author_type'] = [inv_label_map[int(p)] for p in rus_pred]
+
+# Breakdown of Russian accounts by predicted type
+rus_counts = rus_accounts['predicted_author_type'].value_counts()
+rus_pct = (rus_counts / len(rus_accounts)) * 100
+
+print("Russian account-level TF-IDF prediction breakdown (%):")
+print(rus_pct)
+
+# --- Bar chart with fixed colors: random=lightblue, engaged=lightgreen, politician=salmon ---
+order  = ['random_user', 'engaged_user', 'politician']
+colors = ['lightblue',   'lightgreen',  'salmon']
+
+rus_counts_ordered = rus_counts.reindex(order, fill_value=0)
+rus_pct_ordered    = (rus_counts_ordered / rus_counts_ordered.sum()) * 100
+
+plt.figure(figsize=(8, 6))
+bars = plt.bar(order, rus_pct_ordered.values, color=colors)
+for b, pct in zip(bars, rus_pct_ordered.values):
+    plt.text(b.get_x() + b.get_width() / 2, pct + 1, f'{pct:.1f}%', ha='center')
+plt.title("Predicted Author Types — Russian Accounts (Account-Level TF-IDF)")
+plt.ylabel("Percentage of Accounts")
+plt.ylim(0, max(rus_pct_ordered.values) + 10)
+plt.tight_layout()
+plt.show()
+
+# === Save Russian account-level TF-IDF predictions ===
+save_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/predicted_russian_accounts_account_tfidf.csv'
+rus_accounts.to_csv(save_path, index=False)
+print(f"Account-level TF-IDF predictions saved to: {save_path}")
