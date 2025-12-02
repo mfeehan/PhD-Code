@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import pandas as pd
+import numpy as np
+import re
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# === File Paths (balanced 3.1M per class) ===
+politicians_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/PoliticiansDownsampled3.1Mil.csv'
+engaged_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/EngagedUsersDownsampled3.1Mil.csv'
+random_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/RandomUsersDownsampled3.1Mil.csv'
+russian_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/RussianDatasetStudy2workswithXGBoost.csv'
+
+# === Load datasets ===
+politicians   = pd.read_csv(politicians_path, low_memory=True)
+engaged_users = pd.read_csv(engaged_users_path, low_memory=True)
+random_users  = pd.read_csv(random_users_path,  low_memory=True)
+russian       = pd.read_csv(russian_path,       low_memory=True)
+
+# === Labels & combine (no filtering, no rebalance) ===
+politicians['author_type']   = 'politician'
+engaged_users['author_type'] = 'engaged_user'
+random_users['author_type']  = 'random_user'
+combined_df = pd.concat([politicians, engaged_users, random_users], ignore_index=True)
+
+# === Columns & helpers ===
+EMO_COLS = ["fear","anger","trust","surprise","sadness","disgust","joy"]
+MFT_COLS = [
+    'Loyaltyclassification_result', 'Sanctityclassification_result',
+    'Careclassification_result', 'Fairnessclassification_result',
+    'Authorityclassification_result'
+]
+
+_num_pat = re.compile(r".*?\(([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\)")
+def extract_score(val):
+    if isinstance(val, str):
+        m = _num_pat.match(val)
+        if m: return float(m.group(1))
+        return 0.0
+    return float(val) if pd.notnull(val) else 0.0
+
+def ensure_emotions(df: pd.DataFrame) -> pd.DataFrame:
+    emo = pd.DataFrame(index=df.index)
+    for c in EMO_COLS:
+        emo[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0) if c in df.columns else 0.0
+    return emo[EMO_COLS]
+
+# --- Emotions numeric (features only; NO FILTERING) ---
+emotion_df = ensure_emotions(combined_df)
+_ = ensure_emotions(russian)  # keep parity; not used directly
+
+# --- Robust MFT parsing to numeric ---
+for col in MFT_COLS:
+    combined_df[col] = combined_df[col].apply(extract_score) if col in combined_df.columns else 0.0
+    russian[col]     = russian[col].apply(extract_score)     if col in russian.columns     else 0.0
+
+# === Features (emotions + MFT) — partisan removed ===
+FEATURES = EMO_COLS + MFT_COLS
+
+# --- Build X/y ---
+for c in FEATURES:
+    if c not in combined_df.columns:
+        combined_df[c] = 0.0
+    combined_df[c] = pd.to_numeric(combined_df[c], errors='coerce').fillna(0.0)
+
+label_map = {'politician':0, 'engaged_user':1, 'random_user':2}
+combined_df['author_type_numeric'] = combined_df['author_type'].map(label_map)
+
+X_full = pd.concat([emotion_df, combined_df[MFT_COLS]], axis=1)
+y_full = combined_df['author_type_numeric']
+
+print(f"Total training rows used: {len(X_full):,}")
+
+# --- Split (stratified) ---
+X_train, X_test, y_train, y_test = train_test_split(
+    X_full, y_full, test_size=0.20, stratify=y_full, random_state=42
+)
+
+# === Model (simple, no class weights) ===
+model = XGBClassifier(
+    objective='multi:softprob',
+    eval_metric='mlogloss',
+    num_class=3,
+    random_state=42,
+    tree_method="hist"
+)
+print("Training XGBoost — Baseline Tweet Model (No Partisan Words)…")
+model.fit(X_train, y_train)
+
+# === Evaluation ===
+y_pred = model.predict(X_test)
+print("Classification Report:")
+print(classification_report(y_test, y_pred, target_names=['politician','engaged_user','random_user']))
+
+cm = confusion_matrix(y_test, y_pred, labels=[0,1,2])
+plt.figure(figsize=(10,7))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['politician','engaged_user','random_user'],
+            yticklabels=['politician','engaged_user','random_user'])
+plt.title("Confusion Matrix — Baseline Tweet Model (No Partisan Words)")
+plt.xlabel("Predicted"); plt.ylabel("Actual")
+plt.tight_layout(); plt.show()
+
+# === Feature importance ===
+imp = pd.Series(model.feature_importances_, index=FEATURES).sort_values(ascending=False)
+plt.figure(figsize=(10,6))
+sns.barplot(x=imp.values, y=imp.index)
+plt.title("Feature Importance — Baseline Tweet Model (No Partisan Words)")
+plt.tight_layout(); plt.show()
+
+# === Russian tweet-level inference & chart ===
+inv_map = {v:k for k,v in label_map.items()}
+rus_pred = model.predict(russian[EMO_COLS + MFT_COLS])
+rus_labels = pd.Series([inv_map[int(p)] for p in rus_pred])
+
+order  = ['random_user','engaged_user','politician']
+colors = ['lightblue','lightgreen','salmon']
+
+rus_counts = rus_labels.value_counts().reindex(order, fill_value=0)
+rus_pct = (rus_counts / rus_counts.sum()) * 100
+print("Russian prediction breakdown (%):")
+print(rus_pct.round(2))
+
+plt.figure(figsize=(8,6))
+bars = plt.bar(order, rus_pct.values, color=colors)
+for b, pct in zip(bars, rus_pct.values):
+    plt.text(b.get_x() + b.get_width()/2, pct + 0.8, f'{pct:.1f}%', ha='center')
+plt.title("Predicted Author Types — Baseline Tweet Model (No Partisan Words)")
+plt.ylabel("Percentage of Tweets")
+plt.ylim(0, max(rus_pct.values) + 10)
+plt.tight_layout(); plt.show()
+
+# === Diagnostics: per-class sparsity for EMOTIONS & MFT (TRAIN only) ===
+train_df = combined_df.loc[X_train.index].copy()
+train_df['author_type'] = train_df['author_type_numeric'].map(inv_map)
+
+def stats_table(df, cols, label):
+    tbl = {}
+    for c in cols:
+        s = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
+        tbl[c] = {
+            'mean':   s.mean(),
+            'median': s.median(),
+            'present_pct': (s > 0).mean() * 100.0
+        }
+    out = pd.DataFrame(tbl).T
+    out = out[['mean','median','present_pct']].round({'mean':6,'median':6,'present_pct':2})
+    print(f"\n=== {label} (TRAIN split) ===")
+    print(out)
+    return out
+
+print("\n=== Per-class feature sparsity (TRAIN) ===")
+for cls in ['politician','engaged_user','random_user']:
+    print(f"\n--- {cls.upper()} ---")
+    cls_df = train_df[train_df['author_type'] == cls]
+    _emo = stats_table(cls_df, EMO_COLS, "EMOTIONS")
+    _mft = stats_table(cls_df, MFT_COLS,  "MFT")
+
+# Optional: overall (all classes combined) summary
+all_df = train_df
+_ = stats_table(all_df, EMO_COLS, "EMOTIONS — ALL CLASSES")
+_ = stats_table(all_df, MFT_COLS,  "MFT — ALL CLASSES")
