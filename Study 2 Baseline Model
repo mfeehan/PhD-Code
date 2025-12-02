@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from xgboost import XGBClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# === File Paths ===
+politicians_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/PoliticiansDownsampled3.1Mil.csv'
+engaged_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/EngagedUsersDownsampled3.1Mil.csv'
+random_users_path  = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Redo/RandomUsersDownsampled3.1Mil.csv'
+russian_path       = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/RussianDatasetStudy2workswithXGBoost.csv'
+
+# === Load datasets ===
+politicians   = pd.read_csv(politicians_path, low_memory=True)
+engaged_users = pd.read_csv(engaged_users_path, low_memory=True)
+random_users  = pd.read_csv(random_users_path,  low_memory=True)
+russian       = pd.read_csv(russian_path,       low_memory=True)
+
+# === Label and combine ===
+politicians['author_type']   = 'politician'
+engaged_users['author_type'] = 'engaged_user'
+random_users['author_type']  = 'random_user'
+combined_df = pd.concat([politicians, engaged_users, random_users], ignore_index=True)
+
+# === Drop rows missing text ===
+combined_df = combined_df.dropna(subset=['tweet_text'])
+russian = russian.dropna(subset=['tweet_text'])
+
+# === Encode labels ===
+label_map = {'politician':0,'engaged_user':1,'random_user':2}
+combined_df['label'] = combined_df['author_type'].map(label_map)
+
+# === Train/test split ===
+X_train, X_test, y_train, y_test = train_test_split(
+    combined_df['tweet_text'], combined_df['label'],
+    test_size=0.20, stratify=combined_df['label'], random_state=42
+)
+
+# === TF-IDF vectorization ===
+vectorizer = TfidfVectorizer(
+    max_features=10000,
+    stop_words='english',
+    min_df=5,
+    max_df=0.8,
+    token_pattern=r'(?u)\b[#\w][#\w-]*\b',  # preserve hashtags/word-with-dash tokens
+    lowercase=True,
+    dtype=np.float64
+)
+X_train_tfidf = vectorizer.fit_transform(X_train)
+X_test_tfidf  = vectorizer.transform(X_test)
+russian_tfidf = vectorizer.transform(russian['tweet_text'])
+
+# === Model ===
+model = XGBClassifier(
+    objective='multi:softprob',
+    eval_metric='mlogloss',
+    num_class=3,
+    random_state=42,
+    tree_method="hist",
+    n_estimators=300  # stabilize results across runs
+)
+print("Training XGBoost TF-IDF baseline…")
+model.fit(X_train_tfidf, y_train)
+
+# === Evaluation ===
+y_pred = model.predict(X_test_tfidf)
+print("Classification Report:")
+print(classification_report(y_test, y_pred, target_names=['politician','engaged_user','random_user']))
+
+cm = confusion_matrix(y_test, y_pred, labels=[0,1,2])
+plt.figure(figsize=(10,7))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['politician','engaged_user','random_user'],
+            yticklabels=['politician','engaged_user','random_user'])
+plt.title("Confusion Matrix — TF-IDF Tweet-Level Baseline")
+plt.xlabel("Predicted"); plt.ylabel("Actual")
+plt.tight_layout(); plt.show()
+
+# === Russian predictions ===
+inv_map = {v:k for k,v in label_map.items()}
+rus_pred = model.predict(russian_tfidf)
+rus_labels = pd.Series([inv_map[int(p)] for p in rus_pred])
+
+order  = ['random_user','engaged_user','politician']
+colors = ['lightblue','lightgreen','salmon']
+
+rus_counts = rus_labels.value_counts().reindex(order, fill_value=0)
+rus_pct = (rus_counts / rus_counts.sum()) * 100
+print("Russian prediction breakdown (%):")
+print(rus_pct.round(2))
+
+plt.figure(figsize=(8,6))
+bars = plt.bar(order, rus_pct.values, color=colors)
+for b, pct in zip(bars, rus_pct.values):
+    plt.text(b.get_x() + b.get_width()/2, pct + 0.8, f'{pct:.1f}%', ha='center')
+plt.title("Predicted Author Types — Russian Tweets (TF-IDF Baseline)")
+plt.ylabel("Percentage of Tweets")
+plt.ylim(0, max(rus_pct.values) + 10)
+plt.tight_layout(); plt.show()
+
+# === Top weighted features (optional) ===
+imp = model.feature_importances_
+feat_names = np.array(vectorizer.get_feature_names_out())
+top_idx = np.argsort(imp)[::-1][:30]
+top_feats = pd.DataFrame({
+    'Feature': feat_names[top_idx],
+    'Importance': imp[top_idx]
+}).sort_values(by='Importance', ascending=True)  # sort ascending for horizontal bar plot
+
+plt.figure(figsize=(10,8))
+plt.barh(top_feats['Feature'], top_feats['Importance'], color='steelblue')
+plt.xlabel("Feature Importance")
+plt.title("Top 30 TF-IDF Features — Tweet-Level Baseline")
+plt.tight_layout()
+plt.show()
