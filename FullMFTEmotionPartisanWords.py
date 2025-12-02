@@ -12,6 +12,10 @@ import matplotlib.pyplot as plt
 from matplotlib.offsetbox import AnchoredText
 import time
 
+# >>> added imports for improved partisan scraping <<<
+import re, unicodedata
+# <<< end added imports >>>
+
 # Start timer at the very beginning
 start_time = time.time()
 
@@ -65,6 +69,35 @@ PARTISAN_KEYWORDS = [
     'Parkland shooting', 'March for Our Lives', 'Kavanaugh', 'Me Too', '#MeToo'
 ]
 
+# >>> improved partisan scraping helpers (only addition) >>>
+APO = re.compile(r"[’‘´`]")
+WS = re.compile(r"\s+")
+def _norm_text(s: str) -> str:
+    if not isinstance(s, str): return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = APO.sub("'", s).lower()
+    s = WS.sub(" ", s).strip()
+    return s
+
+def _build_pattern(item: str) -> re.Pattern:
+    """
+    Case-insensitive regex that matches:
+      • optional leading '#'
+      • tokens joined by spaces/hyphens/underscores/apostrophes
+      • ZERO-OR-MORE separators to catch compact forms ('rightwing', '#makeamericagreatagain')
+      • word boundaries at ends
+    """
+    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", item.strip()) if t]
+    if not tokens:
+        core = re.escape(item)
+    else:
+        sep = r"[ \-_']*"  # key: * captures compact hashtags/variants
+        core = sep.join(re.escape(t) for t in tokens)
+    return re.compile(rf"(?i)(?<!\w)#?{core}(?!\w)")
+
+PARTISAN_PATTERNS = [(kw, _build_pattern(kw)) for kw in PARTISAN_KEYWORDS]
+# <<< end helpers >>>
+
 # Initialize the Sentiment Analyzer once
 sia = SentimentIntensityAnalyzer()
 
@@ -87,10 +120,24 @@ def process_sentiment_and_engagement(chunk):
     # Engagement calculation with log transformation
     chunk['engagement'] = chunk[['quote_count', 'reply_count', 'like_count', 'retweet_count']].sum(axis=1).apply(np.log1p)
     
-    # Partisan word detection
-    chunk['partisan_words'] = chunk['tweet_text'].str.lower().apply(
-        lambda text: ', '.join([word for word in PARTISAN_KEYWORDS if word in text.split()]) or 'None'
-    )
+    # >>> improved partisan word detection (only change in this function) <<<
+    def _find_partisan(text: str) -> str:
+        s = _norm_text(str(text))
+        hits = []
+        for kw, pat in PARTISAN_PATTERNS:
+            if pat.search(s):
+                hits.append(kw)
+        # unique, preserve first-match order
+        if not hits: 
+            return 'None'
+        seen, out = set(), []
+        for k in hits:
+            kl = k.lower()
+            if kl not in seen:
+                seen.add(kl); out.append(k)
+        return ', '.join(out)
+    chunk['partisan_words'] = chunk['tweet_text'].apply(_find_partisan)
+    # <<< end improved detection >>>
     
     # Affect analysis using NRCLex
     chunk['affect'] = chunk['tweet_text'].apply(lambda x: NRCLex(x).affect_frequencies)
@@ -171,5 +218,3 @@ end_time = time.time()
 total_time = end_time - start_time
 print(f"Data processing complete. Results saved to {final_output_path}")
 print(f"Total runtime: {total_time:.2f} seconds")
-
-
