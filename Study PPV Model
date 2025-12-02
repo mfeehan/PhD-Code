@@ -1,0 +1,236 @@
+import pandas as pd
+import re
+import numpy as np
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# === File Paths (full partisan_fixed datasets; update if needed) ===
+politicians_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/PoliticianFullDatasetStudy2.csv'
+engaged_users_path = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/EngagedUsersFullDataset_augmented__20251111_175631.csv'
+random_users_path   = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/RandomUsersFullDataset_augmented__20251111_182612.csv'
+russian_path        = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/Study 2 Outputs/partisan_fixed/RussianDatasetStudy2workswithXGBoost.csv'
+
+# Output (new file, will not overwrite prior outputs)
+scores_output_path  = '/Users/mathewfeehan/Library/Mobile Documents/com~apple~CloudDocs/PhD Research/IRA/Study 2 and 3 Final Data/account_baseline_with_style_scores.csv'
+
+# === Load tweet-level datasets ===
+politicians   = pd.read_csv(politicians_path, low_memory=True)
+engaged_users = pd.read_csv(engaged_users_path, low_memory=True)
+random_users  = pd.read_csv(random_users_path,  low_memory=True)
+russian       = pd.read_csv(russian_path,       low_memory=True)
+
+# === Label the U.S. training data ===
+politicians['author_type']   = 'politician'
+engaged_users['author_type'] = 'engaged_user'
+random_users['author_type']  = 'random_user'
+
+us_tweets = pd.concat([politicians, engaged_users, random_users], ignore_index=True)
+
+# Drop missing text
+us_tweets = us_tweets.dropna(subset=['tweet_text'])
+russian   = russian.dropna(subset=['tweet_text'])
+
+# Ensure screen_name exists
+if 'screen_name' not in us_tweets.columns or 'screen_name' not in russian.columns:
+    raise ValueError("Expected 'screen_name' column in all datasets for account-level aggregation.")
+
+# === Extract numeric MFT scores from strings like "care (0.87)" ===
+def extract_score(val):
+    if isinstance(val, str):
+        match = re.search(r"\((\d\.\d+)\)", val)
+        return float(match.group(1)) if match else 0.0
+    return float(val) if pd.notnull(val) else 0.0
+
+mft_cols = [
+    'Loyaltyclassification_result',
+    'Sanctityclassification_result',
+    'Careclassification_result',
+    'Fairnessclassification_result',
+    'Authorityclassification_result'
+]
+
+emotion_cols = ['fear', 'anger', 'trust', 'surprise', 'sadness', 'disgust', 'joy']
+
+# Apply MFT extraction
+for col in mft_cols:
+    if col in us_tweets.columns:
+        us_tweets[col] = us_tweets[col].apply(extract_score)
+    if col in russian.columns:
+        russian[col] = russian[col].apply(extract_score)
+
+# Force numeric, fill NaNs
+all_feature_cols = emotion_cols + mft_cols + ['partisan_word_count']
+for col in all_feature_cols:
+    if col in us_tweets.columns:
+        us_tweets[col] = pd.to_numeric(us_tweets[col], errors='coerce').fillna(0.0)
+    if col in russian.columns:
+        russian[col] = pd.to_numeric(russian[col], errors='coerce').fillna(0.0)
+
+# === Account-level aggregation ===
+def aggregate_account(group: pd.DataFrame) -> pd.Series:
+    agg = {}
+    # Percent-present for each MFT and emotion
+    for col in mft_cols + emotion_cols:
+        col_vals = group[col]
+        present_pct = (col_vals > 0).astype(float).mean() if len(group) > 0 else 0.0
+        agg[col + '_present_pct'] = present_pct
+    # Mean partisan_word_count per tweet
+    if 'partisan_word_count' in group.columns:
+        agg['partisan_word_count_mean'] = group['partisan_word_count'].mean()
+    else:
+        agg['partisan_word_count_mean'] = 0.0
+    # Author type (U.S. only)
+    if 'author_type' in group.columns:
+        agg['author_type'] = group['author_type'].iloc[0]
+    return pd.Series(agg)
+
+print("Aggregating U.S. tweets to account level...")
+us_accounts = us_tweets.groupby('screen_name', as_index=False).apply(aggregate_account)
+print(f"Total U.S. accounts: {len(us_accounts):,}")
+
+print("Aggregating Russian tweets to account level...")
+rus_accounts = russian.groupby('screen_name', as_index=False).apply(aggregate_account)
+print(f"Total Russian accounts: {len(rus_accounts):,}")
+
+# === Feature set ===
+account_features = [c + '_present_pct' for c in (mft_cols + emotion_cols)] + [
+    'partisan_word_count_mean'
+]
+
+for col in account_features:
+    us_accounts[col]  = pd.to_numeric(us_accounts[col], errors='coerce').fillna(0.0)
+    rus_accounts[col] = pd.to_numeric(rus_accounts[col], errors='coerce').fillna(0.0)
+
+# === Labels ===
+label_mapping = {'politician': 0, 'engaged_user': 1, 'random_user': 2}
+us_accounts['author_type_numeric'] = us_accounts['author_type'].map(label_mapping)
+
+X = us_accounts[account_features]
+y = us_accounts['author_type_numeric']
+
+print(f"Total U.S. training accounts used (baseline for PPV): {len(X):,}")
+
+# === Train/test split ===
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# === Train XGBoost baseline account model ===
+model = XGBClassifier(
+    objective='multi:softprob',
+    eval_metric='mlogloss',
+    num_class=3,
+    random_state=42,
+    tree_method='hist',
+    n_estimators=300
+)
+
+print("Training XGBoost (account-level baseline for PPV)...")
+model.fit(X_train, y_train)
+
+# === Evaluate on held-out U.S. accounts ===
+y_pred = model.predict(X_test)
+print("Classification Report (account-level baseline for PPV):")
+print(classification_report(y_test, y_pred, target_names=list(label_mapping.keys())))
+
+conf_matrix = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(8, 6))
+sns.heatmap(
+    conf_matrix,
+    annot=True,
+    fmt='d',
+    cmap='Blues',
+    xticklabels=list(label_mapping.keys()),
+    yticklabels=list(label_mapping.keys())
+)
+plt.title("Confusion Matrix: Account-Level Baseline (PPV Model)")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+# === Probabilities and style scores ===
+# U.S. test set
+proba_test = model.predict_proba(X_test)
+# Russian accounts (all positives for PPV purposes)
+proba_rus  = model.predict_proba(rus_accounts[account_features])
+
+# Index mapping
+idx_politician = label_mapping['politician']
+idx_engaged    = label_mapping['engaged_user']
+idx_random     = label_mapping['random_user']
+
+# Style scores
+political_score_test = proba_test[:, idx_politician] + proba_test[:, idx_engaged]
+random_score_test    = proba_test[:, idx_random]
+
+political_score_rus = proba_rus[:, idx_politician] + proba_rus[:, idx_engaged]
+random_score_rus    = proba_rus[:, idx_random]
+
+# Add scores into dataframes for potential export
+us_test_accounts = us_accounts.iloc[X_test.index].copy()
+us_test_accounts['political_score'] = political_score_test
+us_test_accounts['random_score']    = random_score_test
+
+rus_accounts['political_score'] = political_score_rus
+rus_accounts['random_score']    = random_score_rus
+
+# === Thresholds and PPV computation ===
+targets = [0.70, 0.80, 0.90]
+prevalences = [0.001, 0.005, 0.01]  # 0.1%, 0.5%, 1%
+
+def compute_metrics(style_name, rus_scores, test_scores, y_test):
+    """
+    style_name: 'political' or 'random'
+    rus_scores: scores for Russian accounts (positives)
+    test_scores: scores for U.S. test accounts (negatives)
+    y_test: numeric labels for U.S. test accounts
+    """
+    print(f"\n=== {style_name.capitalize()}-style scoring ===")
+    for target in targets:
+        # threshold so that ~target of Russians are above it
+        thr = np.quantile(rus_scores, 1 - target)
+        rus_flag = rus_scores >= thr
+        capture = rus_flag.mean()
+
+        test_flag = test_scores >= thr
+        # FPR per class (politician, engaged, random) on U.S. accounts
+        fpr_politician = test_flag[(y_test == idx_politician)].mean()
+        fpr_engaged    = test_flag[(y_test == idx_engaged)].mean()
+        fpr_random     = test_flag[(y_test == idx_random)].mean()
+        fpr_all        = test_flag.mean()
+
+        print(f"\nTarget capture: {int(target*100)}% (threshold={thr:.3f})")
+        print(f"  Actual Russian capture: {capture*100:.1f}%")
+        print(f"  FPR politicians: {fpr_politician*100:.2f}%")
+        print(f"  FPR engaged:     {fpr_engaged*100:.2f}%")
+        print(f"  FPR random:      {fpr_random*100:.2f}%")
+        print(f"  FPR all U.S.:    {fpr_all*100:.2f}%")
+
+        # PPV at different prevalences
+        for p in prevalences:
+            tpr = capture
+            fpr = fpr_all
+            # PPV = (p * TPR) / (p * TPR + (1 - p) * FPR)
+            numerator   = p * tpr
+            denominator = p * tpr + (1 - p) * fpr
+            ppv = numerator / denominator if denominator > 0 else 0.0
+            print(f"    PPV at prevalence {p*100:.1f}%: {ppv*100:.2f}%")
+
+# Political-style scoring
+compute_metrics('political', political_score_rus, political_score_test, y_test.values)
+
+# Random-style scoring
+compute_metrics('random', random_score_rus, random_score_test, y_test.values)
+
+# === Save scores for further analysis ===
+full_accounts_with_scores = pd.concat(
+    [us_accounts.assign(dataset='US'), rus_accounts.assign(dataset='Russian')],
+    ignore_index=True
+)
+
+full_accounts_with_scores.to_csv(scores_output_path, index=False)
+print(f"\nSaved account-level scores to: {scores_output_path}")
